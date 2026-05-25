@@ -35,6 +35,7 @@ from tpu_inference.layers.vllm.quantization.unquantized import \
 def get_tpu_quantization_config(vllm_config: VllmConfig,
                                 mesh: Mesh) -> QuantizationConfig:
     model_config = copy.deepcopy(vllm_config.model_config)
+
     method_to_config: dict[str | None, Type[QuantizationConfig]] = {
         None: VllmUnquantizedConfig,
         quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
@@ -42,6 +43,7 @@ def get_tpu_quantization_config(vllm_config: VllmConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
+        "deepseek_v4_fp8": VllmFp8Config,   # Map to the standard FP8 config wrapper
     }
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(

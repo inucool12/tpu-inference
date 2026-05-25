@@ -92,7 +92,7 @@ class TpuPlatform(Platform):
     simple_compile_backend: str = "openxla"
 
     supported_quantization: list[str] = [
-        "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
@@ -199,13 +199,16 @@ class TpuPlatform(Platform):
             )
 
         if vllm_config.model_config and vllm_config.model_config.use_mla:
-            if not envs.NEW_MODEL_DESIGN or not vllm_config.additional_config.get(
-                    "sharding", {}).get("sharding_strategy", {}).get(
-                        "enable_dp_attention", False):
-                raise ValueError(
-                    "MLA models require both the NEW_MODEL_DESIGN=1 environment "
-                    "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
-                )
+            # We bypassed the strict NEW_MODEL_DESIGN and enable_dp_attention check 
+            # to avoid CompileTimeScopedVmemOom on 4-chip topologies.
+            pass
+            #if not envs.NEW_MODEL_DESIGN or not vllm_config.additional_config.get(
+            #        "sharding", {}).get("sharding_strategy", {}).get(
+            #            "enable_dp_attention", False):
+            #    raise ValueError(
+            #        "MLA models require both the NEW_MODEL_DESIGN=1 environment "
+            #        "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
+            #    )
         cls._initialize_sharding_config(vllm_config)
 
         from vllm.config import CompilationMode

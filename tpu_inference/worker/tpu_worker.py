@@ -33,6 +33,9 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.offload.metrics import TPUKVCacheStatsLogger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
+# Execute our TPU OOT Patches automatically at boot so vLLM skips CUDA!
+import tpu_inference.models.vllm.experimental.deepseek_v4_vl_patcher
+
 logger = init_logger(__name__)
 
 
