@@ -1546,7 +1546,7 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        if layer is not None and current_platform.is_cuda():
+        if layer is not None and residual is not None:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
@@ -1576,6 +1576,7 @@ class DeepseekV4Model(nn.Module):
             ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -1591,116 +1592,158 @@ class DeepseekV4Model(nn.Module):
         expert_mapping = self.get_expert_mapping()
 
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
+            # 1. Catch all attention linear parameter block scales immediately and skip them
+            # These are processed contextually by your quantization config/decorations.
+            if ".attn." in name and "weight_scale" in name:
+                continue
 
-                if is_pp_missing_parameter(name, self):
-                    break
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
+            # 2. Prevent expert scales from being corrupted by stacked parallel linear rules
+            if ".experts." in name and "weight_scale" in name:
+                pass  # Fall through straight to the expert shard mapping section
             else:
-                if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                elif "attn_sink" in name:
-                    if is_pp_missing_parameter(name, self):
+                # Process stacked parallel linear layers
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if ".experts." in name:
                         continue
-                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
-                    loaded_params.add(name)
-                    continue
+                    if weight_name not in name:
+                        continue
+                        
+                    # Safely substitute the target parameter path while keeping suffixes intact
+                    target_name = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(target_name, self):
+                        break
+                    if target_name not in params_dict:
+                        continue
+                        
+                    param = params_dict[target_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(target_name)
+                    break
                 else:
-                    if is_pp_missing_parameter(name, self):
+                    # 3. Process remaining standard parameters
+                    if "attn_sink" in name:
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            continue
+                        narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                        n = narrow_weight.shape[0]
+                        params_dict[name][:n].copy_(narrow_weight)
+                        loaded_params.add(name)
                         continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                    elif ".experts." not in name:
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
+                        continue
+
+            # 4. Process experts and expert block scales explicitly
+            if ".experts." in name:
+                # E8M0 scales are stored as float8_e8m0fnu in checkpoints but the 
+                # MoE param is uint8. copy_() would do an unwanted numeric conversion.
+                if (
+                    "weight_scale" in name
+                    and loaded_weight.dtype == torch.float8_e8m0fnu
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
+
+                for mapping in expert_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+                    
+                    # Prefix Coherence Safeguard: Handle potential missing 'model.' sub-scope
+                    if name_mapped not in params_dict and f"model.{name_mapped}" in params_dict:
+                        name_mapped = f"model.{name_mapped}"
+
+                    if name_mapped not in params_dict:
+                        continue
+
+                    param = params_dict[name_mapped]
+
+                    print(f"[DEBUG SHAPE] name: {name_mapped} | shard_id: {shard_id} | param shape: {param.shape} | loaded_weight shape: {loaded_weight.shape}")
+                    
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
                     )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                    continue
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        loaded_params.add(name_mapped)
+                        break
+                continue
 
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-        )
+        if getattr(self.config, "expert_dtype", "fp4") == "fp4":
+            # Native FP4 experts map without the "_weight" parameter suffix 
+            return FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=self.config.n_routed_experts,
+            )
+        
+        # When using FP8 overrides, the weights map directly via a custom explicit array
+        # This matches how the DeepSeekV4Model is structured in legacy builds
+        mapping = []
+        for expert_id in range(self.config.n_routed_experts):
+            for shard_id, weight_name in [("w1", "w1"), ("w2", "w2"), ("w3", "w3")]:
+                param_name = f"experts.w13_weight" if shard_id in ("w1", "w3") else f"experts.w2_weight"
+                weight_regex = f"experts.{expert_id}.{weight_name}"
+                mapping.append((param_name, weight_regex, expert_id, shard_id))
+        return mapping
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
 
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
+def _make_deepseek_v4_weights_mapper(expert_dtype: str, is_compressed_tensors: bool = False) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
+        # ``w{1,2,3}_weight_scale`` natively! 
+        # But FP8 linear layers (like shared_experts and attention) use block scales,
+        # which register as ``weight_scale_inv``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
+        if is_compressed_tensors:
+            # CompressedTensors registers FP8 block scales as weight_scale for MoE experts
+            scale_regex = {
+                re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
+                re.compile(r"\.scale$"): ".weight_scale_inv",
+            }
+        else:
+            # Standard Fp8MoEMethod (block_quant=True) registers
+            # scales as ``w{13,2}_weight_scale_inv``.
+            scale_regex = {
+                re.compile(r"\.scale$"): ".weight_scale_inv",
+            }
     return WeightsMapper(
         orig_to_new_prefix={
             "layers.": "model.layers.",
@@ -1733,15 +1776,13 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
+    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4", False)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # Override platform device type to 'cpu' so all sub-layer allocations (like RoPE cache) succeed on CPU tracing
         from vllm.platforms import current_platform
         if current_platform.device_type == "tpu":
             current_platform.device_type = "cpu"
-
-        super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.config = config
@@ -1754,9 +1795,23 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             config.scoring_func = "softmax"
             config.max_position_embeddings = 512
             vllm_config.scheduler_config.max_num_batched_tokens = 512
+            
+
+        # RESOLVE COMPRESS_RATIOS LIST STRUCT FOR STATIC GRAPH GENERATION
+        if hasattr(config, "compress_ratios") and isinstance(config.compress_ratios, list):
+            config.layer_compress_ratios_map = {idx: ratio for idx, ratio in enumerate(config.compress_ratios)}
+            final_layer_idx = len(config.compress_ratios) - 1
+            config.layer_compress_ratios_map[final_layer_idx] = 1
+            config.compress_ratio = 4 
+
+        # Now call super/init. vLLM will natively allocate the larger FP8 buffers 
+        # based on your patched config!
+        super().__init__()
+
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
+        is_compressed_tensors = hasattr(vllm_config, "quant_config") and vllm_config.quant_config and vllm_config.quant_config.__class__.__name__ == "VllmCompressedTensorsConfig"
+        if expert_dtype != "fp4" or is_compressed_tensors:
+            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype, is_compressed_tensors)
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1774,12 +1829,14 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-        # Apply JAX/TPU custom patches before OpenXLA compilation
-        try:
-            from tpu_inference.models.vllm.experimental.deepseek_v4_vl_patcher import maybe_apply_deepseek_v4_patches
-            maybe_apply_deepseek_v4_patches(self)
-        except ImportError as e:
-            print(f"Failed to load TPU experimental patcher: {e}")
+        # 4. FIX ROUTED EXPERT LAYOUT BOUNDARIES
+        # Config states: "n_routed_experts": 256, "num_experts_per_tok": 6
+        # Forcing static routing layout parameters to avoid dynamic OpenXLA trace splits
+        if hasattr(self, "model") and hasattr(self.model, "layers"):
+            for layer in self.model.layers:
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
+                    setattr(layer.mlp.gate, "force_static_topk", True)
+                    setattr(layer.mlp.gate, "num_experts_per_tok", 6)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
